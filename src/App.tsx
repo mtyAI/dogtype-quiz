@@ -3,6 +3,10 @@ import { BREEDS, type Breed, randomImageUrl } from './breeds';
 
 const TOTAL_QUESTIONS = 10;
 const CHOICES_PER_QUESTION = 4;
+/** 画像取得に失敗した場合、別の犬種で再試行する最大回数 */
+const MAX_BUILD_ATTEMPTS = 5;
+/** 1 回の画像ロードにかける最大ミリ秒 (これを超えたら失敗扱い) */
+const IMAGE_LOAD_TIMEOUT_MS = 6000;
 
 type Question = {
   correct: Breed;
@@ -32,12 +36,58 @@ async function fetchBreedImage(breed: Breed): Promise<string> {
   return json.message;
 }
 
-/** 次の設問を生成 */
-async function buildQuestion(): Promise<Question> {
-  const [correct, ...distractors] = pickRandom(BREEDS, CHOICES_PER_QUESTION);
-  const imageUrl = await fetchBreedImage(correct);
-  const choices = pickRandom([correct, ...distractors], CHOICES_PER_QUESTION);
-  return { correct, choices, imageUrl };
+/** 画像 URL を実際にロードして成否を検証 (404 や壊れた画像を弾く) */
+function preloadImage(url: string, timeoutMs = IMAGE_LOAD_TIMEOUT_MS): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    const timer = window.setTimeout(() => {
+      img.src = '';
+      reject(new Error('Image load timed out'));
+    }, timeoutMs);
+    img.onload = () => {
+      window.clearTimeout(timer);
+      resolve();
+    };
+    img.onerror = () => {
+      window.clearTimeout(timer);
+      reject(new Error('Image failed to load'));
+    };
+    img.src = url;
+  });
+}
+
+/**
+ * 次の設問を生成。画像取得／ロードに失敗した犬種は除外して
+ * 別の犬種で再試行する (最大 MAX_BUILD_ATTEMPTS 回)。
+ */
+async function buildQuestion(maxAttempts = MAX_BUILD_ATTEMPTS): Promise<Question> {
+  const failedKeys = new Set<string>();
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const pool = BREEDS.filter((b) => !failedKeys.has(b.apiKey));
+    if (pool.length < CHOICES_PER_QUESTION) break;
+
+    const [correct, ...distractors] = pickRandom(pool, CHOICES_PER_QUESTION);
+    try {
+      const imageUrl = await fetchBreedImage(correct);
+      await preloadImage(imageUrl);
+      const choices = pickRandom([correct, ...distractors], CHOICES_PER_QUESTION);
+      return { correct, choices, imageUrl };
+    } catch (e) {
+      failedKeys.add(correct.apiKey);
+      lastError = e;
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[quiz] attempt ${attempt + 1}/${maxAttempts} failed for ${correct.apiKey}:`,
+        e,
+      );
+    }
+  }
+
+  throw lastError instanceof Error
+    ? lastError
+    : new Error('画像を取得できませんでした');
 }
 
 export default function App() {
